@@ -28,8 +28,12 @@ INSIDE_IS_BELOW = os.getenv("INSIDE_IS_BELOW", "1") == "1"     # flip if the doo
 
 
 def _zone(name):
-    v = os.getenv(name)
-    return tuple(float(x) for x in v.split(",")) if v else None
+    v = (os.getenv(name) or "").split("#")[0].strip()
+    try:
+        z = tuple(float(x) for x in v.split(","))
+        return z if len(z) == 4 else None
+    except ValueError:
+        return None
 
 
 COUNTER_ZONE = _zone("COUNTER_ZONE")              # behind the counter -> employee
