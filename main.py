@@ -28,8 +28,12 @@ INSIDE_IS_BELOW = os.getenv("INSIDE_IS_BELOW", "1") == "1"     # flip if the doo
 
 
 def _zone(name):
-    v = os.getenv(name)
-    return tuple(float(x) for x in v.split(",")) if v else None
+    v = (os.getenv(name) or "").split("#")[0].strip()
+    try:
+        z = tuple(float(x) for x in v.split(","))
+        return z if len(z) == 4 else None
+    except ValueError:
+        return None
 
 
 COUNTER_ZONE = _zone("COUNTER_ZONE")              # behind the counter -> employee
@@ -60,7 +64,10 @@ def to_px(zone, w, h):
 
 def open_cap():
     if isinstance(SOURCE, int):
-        return cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        return cap
     return cv2.VideoCapture(SOURCE)
 
 
@@ -68,8 +75,11 @@ def main():
     cap = open_cap()
     model = YOLO("yolov8n.pt")  # class 0 = person
     last_side = {}
+    counted = defaultdict(set)  # pid -> directions already counted
     votes = defaultdict(lambda: deque(maxlen=VOTE_WINDOW))
     state = {"in_store": 0, "came_in": 0, "left": 0, "employees": 0}
+    cv2.namedWindow("Surveillance.ai", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow("Surveillance.ai", 1280, 720)
 
     while True:
         ok, frame = cap.read()
@@ -88,15 +98,22 @@ def main():
         people = []
         if res.boxes.id is not None:
             for box, pid in zip(res.boxes.xyxy.tolist(), res.boxes.id.int().tolist()):
-                votes[pid].append(bool(is_employee(frame, box, zone_px)))
+                votes[pid].append(bool(is_employee(frame, box, zone_px, pid=pid)))
                 people.append((pid, tuple(box), sum(votes[pid]) > len(votes[pid]) / 2))
 
         state["employees"] = sum(1 for _, _, emp in people if emp)
 
+        margin = int(h * 0.05)  # dead band so jitter on the line doesn't count
         for pid, box, employee in people:
             cy = (box[1] + box[3]) / 2
-            side = "inside" if (cy > door_y) == INSIDE_IS_BELOW else "outside"
-            if not employee and pid in last_side and last_side[pid] != side:
+            if abs(cy - door_y) < margin:
+                side = last_side.get(pid)  # inside the dead band: keep the previous side
+            else:
+                side = "inside" if (cy > door_y) == INSIDE_IS_BELOW else "outside"
+            prev = last_side.get(pid)
+            if (side and prev and prev != side and not employee
+                    and side not in counted[pid]):  # each direction once per person
+                counted[pid].add(side)
                 if side == "inside":
                     state["came_in"] += 1
                     state["in_store"] = max(state["came_in"] - state["left"], 0)
@@ -106,7 +123,8 @@ def main():
                     state["left"] += 1
                     state["in_store"] = max(state["came_in"] - state["left"], 0)
                     log(f"CUSTOMER #{pid} left{stretch.on_left(pid)}", state)
-            last_side[pid] = side
+            if side:
+                last_side[pid] = side
 
             color = (0, 140, 255) if employee else (0, 200, 0)
             x1, y1, x2, y2 = map(int, box)
