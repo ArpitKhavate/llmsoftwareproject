@@ -75,6 +75,7 @@ def main():
     cap = open_cap()
     model = YOLO("yolov8n.pt")  # class 0 = person
     last_side = {}
+    counted = defaultdict(set)  # pid -> directions already counted
     votes = defaultdict(lambda: deque(maxlen=VOTE_WINDOW))
     state = {"in_store": 0, "came_in": 0, "left": 0, "employees": 0}
     cv2.namedWindow("Surveillance.ai", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
@@ -102,10 +103,17 @@ def main():
 
         state["employees"] = sum(1 for _, _, emp in people if emp)
 
+        margin = int(h * 0.05)  # dead band so jitter on the line doesn't count
         for pid, box, employee in people:
             cy = (box[1] + box[3]) / 2
-            side = "inside" if (cy > door_y) == INSIDE_IS_BELOW else "outside"
-            if not employee and pid in last_side and last_side[pid] != side:
+            if abs(cy - door_y) < margin:
+                side = last_side.get(pid)  # inside the dead band: keep the previous side
+            else:
+                side = "inside" if (cy > door_y) == INSIDE_IS_BELOW else "outside"
+            prev = last_side.get(pid)
+            if (side and prev and prev != side and not employee
+                    and side not in counted[pid]):  # each direction once per person
+                counted[pid].add(side)
                 if side == "inside":
                     state["came_in"] += 1
                     state["in_store"] = max(state["came_in"] - state["left"], 0)
@@ -115,7 +123,8 @@ def main():
                     state["left"] += 1
                     state["in_store"] = max(state["came_in"] - state["left"], 0)
                     log(f"CUSTOMER #{pid} left{stretch.on_left(pid)}", state)
-            last_side[pid] = side
+            if side:
+                last_side[pid] = side
 
             color = (0, 140, 255) if employee else (0, 200, 0)
             x1, y1, x2, y2 = map(int, box)
