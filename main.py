@@ -1,7 +1,9 @@
 """Surveillance.ai: live customer in/out counter (LLMSoftware x UTD Challenge 1).
 
-Run:  python main.py            (webcam index from CAMERA in .env, default 0)
-Keys: q = quit
+OWNER: Jamshed (issue #1). Other modules plug in through fixed functions:
+  employee.py (Nandhan), stretch.py (Lokesh), alerts.py (Arpit).
+
+Run:  python main.py      Keys: q = quit, s = AI session summary
 """
 import os
 import time
@@ -11,34 +13,59 @@ import cv2
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
-from employee import is_employee
-
 load_dotenv()
 
+import alerts  # noqa: E402  (after load_dotenv so modules can read env at import)
+import stretch  # noqa: E402
+from employee import is_employee  # noqa: E402
+
 # CAMERA can be a webcam index ("0", "1") or a path/URL ("nest_backup.mp4")
-_src = os.getenv("CAMERA", "0")
+_src = os.getenv("CAMERA", "1")
 SOURCE = int(_src) if _src.isdigit() else _src
 
-# Door line: horizontal line at DOOR_Y as a fraction of frame height (tune for your camera)
-DOOR_Y_FRAC = float(os.getenv("DOOR_Y_FRAC", "0.5"))
-INSIDE_IS_BELOW = os.getenv("INSIDE_IS_BELOW", "1") == "1"  # flip if the door faces the other way
-# Counter zone (x1,y1,x2,y2 as fractions of frame), anyone whose feet are inside = employee
-COUNTER_ZONE = os.getenv("COUNTER_ZONE")  # e.g. "0.6,0.0,1.0,0.4"
-COUNTER_ZONE = tuple(float(v) for v in COUNTER_ZONE.split(",")) if COUNTER_ZONE else None
-
-VOTE_WINDOW = 15  # frames of employee/customer votes kept per person (stops label flicker)
+DOOR_Y_FRAC = float(os.getenv("DOOR_Y_FRAC", "0.5"))          # door line height, fraction of frame
+INSIDE_IS_BELOW = os.getenv("INSIDE_IS_BELOW", "1") == "1"     # flip if the door faces the other way
 
 
-def log(msg, state):
-    line = (f"[{time.strftime('%I:%M:%S %p')}] {msg:<28} | In store: {state['in_store']} | "
-            f"Came in: {state['came_in']} | Left: {state['left']} | Employees: {state['employees']}")
+def _zone(name):
+    v = os.getenv(name)
+    return tuple(float(x) for x in v.split(",")) if v else None
+
+
+COUNTER_ZONE = _zone("COUNTER_ZONE")              # behind the counter -> employee
+COUNTER_FRONT_ZONE = _zone("COUNTER_FRONT_ZONE")  # where customers wait (used by stretch.py)
+VOTE_WINDOW = 15  # per-person employee votes kept (stops label flicker)
+
+
+def stamp():
+    return time.strftime("%I:%M:%S %p")
+
+
+def log(msg, state=None):
+    line = f"[{stamp()}] {msg}"
+    if state is not None:
+        line = (f"[{stamp()}] {msg:<34} | In store: {state['in_store']} | Came in: {state['came_in']} | "
+                f"Left: {state['left']} | Employees: {state['employees']}")
     print(line, flush=True)
     with open("events.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
+def to_px(zone, w, h):
+    if not zone:
+        return None
+    x1, y1, x2, y2 = zone
+    return int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+
+
+def open_cap():
+    if isinstance(SOURCE, int):
+        return cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW)
+    return cv2.VideoCapture(SOURCE)
+
+
 def main():
-    cap = cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW) if isinstance(SOURCE, int) else cv2.VideoCapture(SOURCE)
+    cap = open_cap()
     model = YOLO("yolov8n.pt")  # class 0 = person
     last_side = {}
     votes = defaultdict(lambda: deque(maxlen=VOTE_WINDOW))
@@ -49,62 +76,70 @@ def main():
         if not ok:
             print("camera offline, reconnecting...")
             time.sleep(0.5)
-            cap = cv2.VideoCapture(SOURCE)
+            cap = open_cap()
             continue
 
         h, w = frame.shape[:2]
         door_y = int(h * DOOR_Y_FRAC)
-        zone_px = None
-        if COUNTER_ZONE:
-            zx1, zy1, zx2, zy2 = COUNTER_ZONE
-            zone_px = (int(zx1 * w), int(zy1 * h), int(zx2 * w), int(zy2 * h))
+        zone_px = to_px(COUNTER_ZONE, w, h)
+        front_px = to_px(COUNTER_FRONT_ZONE, w, h)
 
         res = model.track(frame, classes=[0], persist=True, verbose=False, tracker="bytetrack.yaml")[0]
-        employees_now = 0
-
+        people = []
         if res.boxes.id is not None:
             for box, pid in zip(res.boxes.xyxy.tolist(), res.boxes.id.int().tolist()):
-                votes[pid].append(is_employee(frame, box, zone_px))
-                employee = sum(votes[pid]) > len(votes[pid]) / 2
-                if employee:
-                    employees_now += 1
+                votes[pid].append(bool(is_employee(frame, box, zone_px)))
+                people.append((pid, tuple(box), sum(votes[pid]) > len(votes[pid]) / 2))
 
-                cy = (box[1] + box[3]) / 2
-                below = cy > door_y
-                side = "inside" if below == INSIDE_IS_BELOW else "outside"
-                if not employee and pid in last_side and last_side[pid] != side:
-                    if side == "inside":
-                        state["came_in"] += 1
-                        log(f"CUSTOMER #{pid} came in", {**state, "in_store": max(state["came_in"] - state["left"], 0), "employees": employees_now})
-                    else:
-                        state["left"] += 1
-                        log(f"CUSTOMER #{pid} left", {**state, "in_store": max(state["came_in"] - state["left"], 0), "employees": employees_now})
-                last_side[pid] = side
+        state["employees"] = sum(1 for _, _, emp in people if emp)
 
-                color = (0, 140, 255) if employee else (0, 200, 0)
-                label = f"{'EMPLOYEE' if employee else 'CUSTOMER'} #{pid}"
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, max(y1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        for pid, box, employee in people:
+            cy = (box[1] + box[3]) / 2
+            side = "inside" if (cy > door_y) == INSIDE_IS_BELOW else "outside"
+            if not employee and pid in last_side and last_side[pid] != side:
+                if side == "inside":
+                    state["came_in"] += 1
+                    state["in_store"] = max(state["came_in"] - state["left"], 0)
+                    stretch.on_came_in(pid)
+                    log(f"CUSTOMER #{pid} came in", state)
+                else:
+                    state["left"] += 1
+                    state["in_store"] = max(state["came_in"] - state["left"], 0)
+                    log(f"CUSTOMER #{pid} left{stretch.on_left(pid)}", state)
+            last_side[pid] = side
 
-        state["employees"] = employees_now
-        state["in_store"] = max(state["came_in"] - state["left"], 0)
+            color = (0, 140, 255) if employee else (0, 200, 0)
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{'EMPLOYEE' if employee else 'CUSTOMER'} #{pid}", (x1, max(y1 - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+        for alert in stretch.on_frame(people, front_px, zone_px):
+            log(f"ALERT: {alert}")
+            alerts.send_alert(alert)
+
+        # overlay
         cv2.line(frame, (0, door_y), (w, door_y), (0, 0, 255), 2)
         if zone_px:
             cv2.rectangle(frame, zone_px[:2], zone_px[2:], (255, 120, 0), 2)
+        if front_px:
+            cv2.rectangle(frame, front_px[:2], front_px[2:], (255, 255, 0), 1)
         hud = [f"Customers in store: {state['in_store']}", f"Came in: {state['came_in']}",
-               f"Left: {state['left']}", f"Employees on floor: {state['employees']}"]
-        cv2.rectangle(frame, (0, 0), (330, 30 + 28 * len(hud)), (0, 0, 0), -1)
+               f"Left: {state['left']}", f"Employees on floor: {state['employees']}"] + stretch.hud_lines()
+        cv2.rectangle(frame, (0, 0), (340, 18 + 28 * len(hud)), (0, 0, 0), -1)
         for i, t in enumerate(hud):
             cv2.putText(frame, t, (10, 28 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         cv2.imshow("Surveillance.ai", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("s"):
+            alerts.summarize_session("events.log")
+        if key == ord("q"):
             break
 
     cap.release()
     cv2.destroyAllWindows()
+    alerts.summarize_session("events.log")
 
 
 if __name__ == "__main__":
