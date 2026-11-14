@@ -98,7 +98,7 @@ def main():
         people = []
         if res.boxes.id is not None:
             for box, pid in zip(res.boxes.xyxy.tolist(), res.boxes.id.int().tolist()):
-                votes[pid].append(bool(is_employee(frame, box, zone_px)))
+                votes[pid].append(bool(is_employee(frame, box, zone_px, pid=pid)))
                 people.append((pid, tuple(box), sum(votes[pid]) > len(votes[pid]) / 2))
 
         state["employees"] = sum(1 for _, _, emp in people if emp)
