@@ -64,7 +64,10 @@ def to_px(zone, w, h):
 
 def open_cap():
     if isinstance(SOURCE, int):
-        return cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        return cap
     return cv2.VideoCapture(SOURCE)
 
 
@@ -74,6 +77,8 @@ def main():
     last_side = {}
     votes = defaultdict(lambda: deque(maxlen=VOTE_WINDOW))
     state = {"in_store": 0, "came_in": 0, "left": 0, "employees": 0}
+    cv2.namedWindow("Surveillance.ai", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow("Surveillance.ai", 1280, 720)
 
     while True:
         ok, frame = cap.read()
